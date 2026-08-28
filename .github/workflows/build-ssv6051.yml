@@ -1,0 +1,185 @@
+name: Build SSV6051 for Ophub
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Ophub kernel version (without -ophub)"
+        required: true
+        default: "6.18.48"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ssv6051-${{ inputs.kernel_version }}-ophub
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    env:
+      KERNEL_VERSION: ${{ inputs.kernel_version }}
+      DRIVER_REPO: https://github.com/rayhanorigin/SV6051-SV6051P-WiFi-driver-for-Amlogic-S905W-X96-Mini-with-DKMS-support..git
+      TOOLCHAIN_ARCHIVE: arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu.tar.xz
+      TOOLCHAIN_URL: https://github.com/ophub/kernel/releases/download/dev/arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu.tar.xz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show build host
+        run: |
+          set -euxo pipefail
+          uname -a
+          ldd --version | head -n1
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential ca-certificates curl git kmod xz-utils
+
+      - name: Download Ophub kernel headers
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/ophub-debs" "$RUNNER_TEMP/kernel-root"
+          curl -fL --retry 3 \
+            "https://github.com/ophub/kernel/releases/download/kernel_stable/deb-${KERNEL_VERSION}.tar.gz" \
+            -o "$RUNNER_TEMP/ophub-debs.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ophub-debs.tar.gz" -C "$RUNNER_TEMP/ophub-debs"
+
+          HEADER_DEB="$(find "$RUNNER_TEMP/ophub-debs" -type f \
+            \( -iname '*headers*.deb' -o -iname '*header*.deb' \) | head -n1)"
+          test -n "$HEADER_DEB"
+          echo "Using headers package: $HEADER_DEB"
+
+          dpkg-deb -x "$HEADER_DEB" "$RUNNER_TEMP/kernel-root"
+
+          KBUILD="$(find "$RUNNER_TEMP/kernel-root/usr/src" -maxdepth 1 -type d \
+            -name "linux-headers-${KERNEL_VERSION}-ophub*" | head -n1)"
+          test -n "$KBUILD"
+          test -x "$KBUILD/scripts/mod/modpost"
+
+          echo "KBUILD=$KBUILD" >> "$GITHUB_ENV"
+          echo "Kernel headers: $KBUILD"
+          "$KBUILD/scripts/mod/modpost" --help >/dev/null 2>&1 || true
+
+      - name: Install matching Arm GNU 15.3 toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/toolchain"
+          curl -fL --retry 3 "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+          tar -xJf "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE" -C "$RUNNER_TEMP/toolchain"
+
+          TOOLCHAIN_DIR="$(find "$RUNNER_TEMP/toolchain" -maxdepth 1 -type d \
+            -name 'arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu' | head -n1)"
+          test -x "$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-gcc"
+
+          echo "CC=$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "LD=$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-ld.bfd" >> "$GITHUB_ENV"
+          "$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-gcc" --version | head -n1
+
+      - name: Prepare SSV6051 source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 "$DRIVER_REPO" "$RUNNER_TEMP/ssv6051-repo"
+
+          mkdir -p "$RUNNER_TEMP/driver"
+          tar -xzf "$RUNNER_TEMP/ssv6051-repo/ssv6051-dkms-master-backup.tar.gz" \
+            -C "$RUNNER_TEMP/driver"
+
+          DRIVER_DIR="$(find "$RUNNER_TEMP/driver" -maxdepth 1 -type d -name 'ssv6051-*' | head -n1)"
+          test -n "$DRIVER_DIR"
+          test -f "$DRIVER_DIR/Makefile"
+
+          # DKMS/Kbuild fix: pwd points at the kernel tree under "make -C".
+          # $(src) always points at the external module source directory.
+          sed -i 's|KBUILD_TOP := $(shell pwd)|KBUILD_TOP := $(src)|' "$DRIVER_DIR/Makefile"
+
+          grep -q 'KBUILD_TOP := $(src)' "$DRIVER_DIR/Makefile"
+          grep -q -- '-DSDIO_USE_SLOW_CLOCK' "$DRIVER_DIR/Makefile"
+
+          echo "DRIVER_DIR=$DRIVER_DIR" >> "$GITHUB_ENV"
+
+      - name: Build module
+        run: |
+          set -euxo pipefail
+          make -j2 \
+            CC="$CC" \
+            LD="$LD" \
+            ARCH=arm64 \
+            KERNELRELEASE="${KERNEL_VERSION}-ophub" \
+            -C "$KBUILD" \
+            M="$DRIVER_DIR" \
+            modules
+
+          test -f "$DRIVER_DIR/ssv6051.ko"
+          "$CC" --version | head -n1
+
+      - name: Verify module
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/pkg"
+
+          cp "$DRIVER_DIR/ssv6051.ko" "$RUNNER_TEMP/pkg/"
+          cp "$DRIVER_DIR/Makefile" "$RUNNER_TEMP/pkg/Makefile.used"
+
+          # Keep useful firmware/config payloads if the driver tree contains any.
+          find "$DRIVER_DIR" -type f \
+            \( -iname '*.bin' -o -iname '*.fw' -o -iname '*.hex' \) \
+            -exec cp --parents '{}' "$RUNNER_TEMP/pkg/" \; || true
+
+          /sbin/modinfo "$RUNNER_TEMP/pkg/ssv6051.ko" || true
+          strings "$RUNNER_TEMP/pkg/ssv6051.ko" | grep -F "${KERNEL_VERSION}-ophub" | head -n1 || true
+
+          cat > "$RUNNER_TEMP/pkg/install.sh" <<'INSTALL'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          EXPECTED_KERNEL="__EXPECTED_KERNEL__"
+          MODULE="ssv6051"
+          KO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/ssv6051.ko"
+
+          if [[ "$(uname -r)" != "$EXPECTED_KERNEL" ]]; then
+            echo "ERROR: this module was built for $EXPECTED_KERNEL, running kernel is $(uname -r)" >&2
+            exit 1
+          fi
+
+          [[ -f "$KO" ]] || { echo "ERROR: ssv6051.ko not found" >&2; exit 1; }
+
+          DEST="/lib/modules/$EXPECTED_KERNEL/updates/ssv6051"
+          sudo mkdir -p "$DEST"
+          sudo install -m 0644 "$KO" "$DEST/ssv6051.ko"
+          sudo depmod -a "$EXPECTED_KERNEL"
+          sudo modprobe ssv6051
+
+          echo
+          lsmod | grep '^ssv6051' || true
+          ip link show || true
+          command -v nmcli >/dev/null && nmcli device status || true
+          INSTALL
+
+          sed -i "s/__EXPECTED_KERNEL__/${KERNEL_VERSION}-ophub/g" "$RUNNER_TEMP/pkg/install.sh"
+          chmod +x "$RUNNER_TEMP/pkg/install.sh"
+
+          cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
+          SSV6051 module built for: ${KERNEL_VERSION}-ophub
+          Architecture: aarch64
+          Compiler: Arm GNU Toolchain 15.3.Rel1
+          SDIO slow-clock fix: enabled
+
+          Copy this directory to the TX3 Mini and run:
+            chmod +x install.sh
+            ./install.sh
+          EOF
+
+      - name: Upload SSV6051 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssv6051-${{ inputs.kernel_version }}-ophub-aarch64
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 30
