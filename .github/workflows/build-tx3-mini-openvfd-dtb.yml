@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_version:
-        description: "Ophub kernel version"
+        description: "Kernel label for artifact"
         required: true
         default: "6.18.48"
         type: string
@@ -16,71 +16,49 @@ jobs:
   build:
     name: tx3-mini-openvfd-${{ inputs.kernel_version }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     env:
       KERNEL_VERSION: ${{ inputs.kernel_version }}
       DTB_NAME: meson-gxl-s905w-tx3-mini.dtb
+      REPO_DTB: build-armbian/armbian-files/platform-files/amlogic/bootfs/dtb/amlogic/meson-gxl-s905w-tx3-mini.dtb
+      OPENVFD_CONF: build-armbian/armbian-files/platform-files/amlogic/rootfs/usr/share/openvfd/conf/tx3-mini.conf
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install device-tree tools
+      - name: Install device-tree compiler
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler curl dpkg-dev
+          sudo apt-get install -y device-tree-compiler
 
-      - name: Download matching Ophub DEB bundle
+      - name: Use TX3 Mini DTB from this repository
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/ophub" "$RUNNER_TEMP/extracted"
+          test -f "$REPO_DTB"
 
-          curl -fL --retry 3 \
-            "https://github.com/ophub/kernel/releases/download/kernel_stable/deb-${KERNEL_VERSION}.tar.gz" \
-            -o "$RUNNER_TEMP/ophub-debs.tar.gz"
+          echo "Using repository DTB:"
+          ls -l "$REPO_DTB"
+          sha256sum "$REPO_DTB"
 
-          tar -xzf "$RUNNER_TEMP/ophub-debs.tar.gz" -C "$RUNNER_TEMP/ophub"
-
-          echo "Files in Ophub bundle:"
-          find "$RUNNER_TEMP/ophub" -maxdepth 3 -type f | sort
-
-          DTB_DEB=""
-          while IFS= read -r deb; do
-            if dpkg-deb -c "$deb" | grep -q "/$DTB_NAME$"; then
-              DTB_DEB="$deb"
-              break
-            fi
-          done < <(find "$RUNNER_TEMP/ophub" -type f -name '*.deb' | sort)
-
-          if [ -z "$DTB_DEB" ]; then
-            echo "::error::No DEB in deb-${KERNEL_VERSION}.tar.gz contains $DTB_NAME"
-            exit 1
-          fi
-
-          echo "Using DTB package: $DTB_DEB"
-          dpkg-deb -x "$DTB_DEB" "$RUNNER_TEMP/extracted"
-
-          DTB_PATH="$(find "$RUNNER_TEMP/extracted" -type f -name "$DTB_NAME" | head -n1)"
-          if [ -z "$DTB_PATH" ]; then
-            echo "::error::Could not extract $DTB_NAME from $DTB_DEB"
-            exit 1
-          fi
-
-          echo "SOURCE_DTB=$DTB_PATH" >> "$GITHUB_ENV"
-          echo "Found: $DTB_PATH"
+          # This is the same platform DTB shipped by the amlogic-s9xxx-armbian tree.
+          echo "SOURCE_DTB=$GITHUB_WORKSPACE/$REPO_DTB" >> "$GITHUB_ENV"
 
       - name: Decompile DTB
         run: |
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/work"
-          dtc -I dtb -O dts -o "$RUNNER_TEMP/work/tx3-mini.dts" "$SOURCE_DTB"
+          dtc -I dtb -O dts \
+            -o "$RUNNER_TEMP/work/tx3-mini.dts" \
+            "$SOURCE_DTB"
 
       - name: Inject OpenVFD node
         shell: python
         run: |
           from pathlib import Path
+
           p = Path("${{ runner.temp }}/work/tx3-mini.dts")
           s = p.read_text()
 
@@ -106,7 +84,7 @@ jobs:
 
           assert 'compatible = "open,vfd";' in p.read_text()
 
-      - name: Compile patched DTB
+      - name: Compile and verify patched DTB
         run: |
           set -euxo pipefail
           mkdir -p "$RUNNER_TEMP/pkg"
@@ -115,12 +93,21 @@ jobs:
             -o "$RUNNER_TEMP/pkg/$DTB_NAME" \
             "$RUNNER_TEMP/work/tx3-mini.dts"
 
+          echo "Patched DTB:"
+          ls -l "$RUNNER_TEMP/pkg/$DTB_NAME"
+          sha256sum "$RUNNER_TEMP/pkg/$DTB_NAME"
+
+          echo "Verifying OpenVFD node:"
           dtc -I dtb -O dts "$RUNNER_TEMP/pkg/$DTB_NAME" \
             | grep -A6 -B2 -F 'compatible = "open,vfd";'
 
           cp "$RUNNER_TEMP/work/tx3-mini.dts" "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
 
-      - name: Create installer and rollback
+          if [ -f "$OPENVFD_CONF" ]; then
+            cp "$OPENVFD_CONF" "$RUNNER_TEMP/pkg/tx3-mini.conf"
+          fi
+
+      - name: Create safe installer and rollback
         run: |
           set -euxo pipefail
 
@@ -136,6 +123,14 @@ jobs:
           [[ -f "$SRC" ]] || { echo "Missing patched DTB: $SRC"; exit 1; }
           [[ -f "$TARGET" ]] || { echo "Current DTB not found: $TARGET"; exit 1; }
 
+          echo "Current DTB:"
+          ls -l "$TARGET"
+          sha256sum "$TARGET"
+
+          echo "New DTB:"
+          ls -l "$SRC"
+          sha256sum "$SRC"
+
           if [[ ! -f "$BACKUP" ]]; then
               cp -a "$TARGET" "$BACKUP"
               echo "Backup created: $BACKUP"
@@ -145,8 +140,11 @@ jobs:
 
           install -m 0644 "$SRC" "$TARGET"
           sync
+
+          echo
           echo "Patched DTB installed."
           echo "Reboot with: sudo reboot"
+          echo "Rollback with: sudo ./restore-dtb.sh"
           INSTALL
 
           cat > "$RUNNER_TEMP/pkg/restore-dtb.sh" <<'RESTORE'
@@ -167,10 +165,16 @@ jobs:
           chmod +x "$RUNNER_TEMP/pkg/install-dtb.sh" "$RUNNER_TEMP/pkg/restore-dtb.sh"
 
           cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
-          TX3 Mini OpenVFD DTB for Ophub ${KERNEL_VERSION}
+          TX3 Mini OpenVFD DTB
+          ====================
+          Base DTB:
+            $REPO_DTB
 
-          Source bundle:
-            deb-${KERNEL_VERSION}.tar.gz
+          Artifact label:
+            ${KERNEL_VERSION}
+
+          The base DTB is taken directly from this amlogic-s9xxx-armbian repository.
+          The workflow adds only the minimal OpenVFD node.
 
           Install:
             chmod +x install-dtb.sh restore-dtb.sh
