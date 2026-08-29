@@ -1,0 +1,180 @@
+name: Build TX3 Mini OpenVFD DTB
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Ophub kernel version"
+        required: true
+        default: "6.18.48"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: tx3-mini-openvfd-${{ inputs.kernel_version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      KERNEL_VERSION: ${{ inputs.kernel_version }}
+      DTB_NAME: meson-gxl-s905w-tx3-mini.dtb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install device-tree tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler curl
+
+      - name: Download matching Ophub kernel package
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/kernel"
+          curl -fL --retry 3 \
+            "https://github.com/ophub/kernel/releases/download/kernel_stable/${KERNEL_VERSION}.tar.gz" \
+            -o "$RUNNER_TEMP/kernel.tar.gz"
+          tar -xzf "$RUNNER_TEMP/kernel.tar.gz" -C "$RUNNER_TEMP/kernel"
+
+          DTB_PATH="$(find "$RUNNER_TEMP/kernel" -type f -name "$DTB_NAME" | head -n1)"
+          if [ -z "$DTB_PATH" ]; then
+            echo "::error::Could not find $DTB_NAME in Ophub kernel archive ${KERNEL_VERSION}.tar.gz"
+            find "$RUNNER_TEMP/kernel" -maxdepth 4 -type f | sort | head -200
+            exit 1
+          fi
+
+          echo "SOURCE_DTB=$DTB_PATH" >> "$GITHUB_ENV"
+          echo "Found: $DTB_PATH"
+
+      - name: Decompile DTB
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/work"
+          dtc -I dtb -O dts -o "$RUNNER_TEMP/work/tx3-mini.dts" "$SOURCE_DTB"
+
+      - name: Inject OpenVFD node
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path("${{ runner.temp }}/work/tx3-mini.dts")
+          s = p.read_text()
+
+          if 'compatible = "open,vfd";' in s:
+              print("OpenVFD node already present; leaving DTS unchanged.")
+          else:
+              marker = "/ {"
+              pos = s.find(marker)
+              if pos < 0:
+                  raise SystemExit("Root node '/ {' not found in decompiled DTS")
+
+              insert_at = pos + len(marker)
+              node = r'''
+
+              openvfd {
+                  compatible = "open,vfd";
+                  dev_name = "openvfd";
+                  status = "okay";
+              };
+          '''
+              s = s[:insert_at] + node + s[insert_at:]
+              p.write_text(s)
+
+          print("OpenVFD node present:", 'compatible = "open,vfd";' in p.read_text())
+
+      - name: Compile patched DTB
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/pkg"
+          dtc -I dts -O dtb \
+            -o "$RUNNER_TEMP/pkg/$DTB_NAME" \
+            "$RUNNER_TEMP/work/tx3-mini.dts"
+
+          dtc -I dtb -O dts "$RUNNER_TEMP/pkg/$DTB_NAME" \
+            | grep -A6 -B2 -F 'compatible = "open,vfd";'
+
+          cp "$RUNNER_TEMP/work/tx3-mini.dts" "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
+
+      - name: Create safe installer and rollback scripts
+        run: |
+          set -euxo pipefail
+
+          cat > "$RUNNER_TEMP/pkg/install-dtb.sh" <<'INSTALL'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          TARGET="/boot/dtb/amlogic/meson-gxl-s905w-tx3-mini.dtb"
+          SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/meson-gxl-s905w-tx3-mini.dtb"
+          BACKUP="${TARGET}.pre-openvfd"
+
+          [[ $EUID -eq 0 ]] || { echo "Run as root: sudo ./install-dtb.sh"; exit 1; }
+          [[ -f "$SRC" ]] || { echo "Missing patched DTB: $SRC"; exit 1; }
+          [[ -f "$TARGET" ]] || { echo "Current DTB not found: $TARGET"; exit 1; }
+
+          if [[ ! -f "$BACKUP" ]]; then
+              cp -a "$TARGET" "$BACKUP"
+              echo "Backup created: $BACKUP"
+          else
+              echo "Backup already exists: $BACKUP"
+          fi
+
+          install -m 0644 "$SRC" "$TARGET"
+          sync
+
+          echo
+          echo "Patched DTB installed."
+          echo "Reboot with: sudo reboot"
+          echo "Rollback is available with: sudo ./restore-dtb.sh"
+          INSTALL
+
+          cat > "$RUNNER_TEMP/pkg/restore-dtb.sh" <<'RESTORE'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          TARGET="/boot/dtb/amlogic/meson-gxl-s905w-tx3-mini.dtb"
+          BACKUP="${TARGET}.pre-openvfd"
+
+          [[ $EUID -eq 0 ]] || { echo "Run as root: sudo ./restore-dtb.sh"; exit 1; }
+          [[ -f "$BACKUP" ]] || { echo "Backup not found: $BACKUP"; exit 1; }
+
+          cp -a "$BACKUP" "$TARGET"
+          sync
+          echo "Original DTB restored. Reboot with: sudo reboot"
+          RESTORE
+
+          chmod +x "$RUNNER_TEMP/pkg/install-dtb.sh" "$RUNNER_TEMP/pkg/restore-dtb.sh"
+
+          cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
+          TX3 Mini OpenVFD DTB
+          ====================
+          Source: Ophub kernel release ${KERNEL_VERSION}.tar.gz
+          DTB: meson-gxl-s905w-tx3-mini.dtb
+
+          This build only adds:
+            openvfd {
+              compatible = "open,vfd";
+              dev_name = "openvfd";
+              status = "okay";
+            };
+
+          On the TX3 Mini:
+            chmod +x install-dtb.sh restore-dtb.sh
+            sudo ./install-dtb.sh
+            sudo reboot
+
+          Rollback:
+            sudo ./restore-dtb.sh
+            sudo reboot
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tx3-mini-openvfd-dtb-${{ inputs.kernel_version }}
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 30
