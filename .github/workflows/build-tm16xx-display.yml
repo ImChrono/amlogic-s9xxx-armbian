@@ -96,11 +96,11 @@ jobs:
           cat > "$MDIR/Makefile" <<'KBUILD'
           obj-m += line-display.o
           obj-m += tm16xx.o
-          tm16xx-y := tm16xx_core.o tm16xx_keypad.o
+          tm16xx-y := tm16xx_core.o
           obj-m += tm16xx_spi.o
           KBUILD
 
-          EXTRA_CFLAGS="-include $MDIR/tm16xx_compat.h -I$DRIVER_DIR/include -DCONFIG_TM16XX -DCONFIG_TM16XX_SPI -DCONFIG_TM16XX_KEYPAD"
+          EXTRA_CFLAGS="-include $MDIR/tm16xx_compat.h -I$DRIVER_DIR/include -DCONFIG_TM16XX -DCONFIG_TM16XX_SPI"
 
           make -j2 \
             CC="$CC" \
