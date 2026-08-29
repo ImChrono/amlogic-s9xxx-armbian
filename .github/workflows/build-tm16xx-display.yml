@@ -1,0 +1,197 @@
+name: Build TM16xx display for Ophub
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Ophub kernel version (without -ophub)"
+        required: true
+        default: "6.18.48"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: tm16xx-${{ inputs.kernel_version }}-ophub
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    env:
+      KERNEL_VERSION: ${{ inputs.kernel_version }}
+      DRIVER_REPO: https://github.com/jefflessard/tm16xx-display.git
+      TOOLCHAIN_ARCHIVE: arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu.tar.xz
+      TOOLCHAIN_URL: https://github.com/ophub/kernel/releases/download/dev/arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu.tar.xz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y             build-essential ca-certificates curl git kmod xz-utils
+
+      - name: Download Ophub kernel headers
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/ophub-debs" "$RUNNER_TEMP/kernel-root"
+
+          curl -fL --retry 3             "https://github.com/ophub/kernel/releases/download/kernel_stable/deb-${KERNEL_VERSION}.tar.gz"             -o "$RUNNER_TEMP/ophub-debs.tar.gz"
+
+          tar -xzf "$RUNNER_TEMP/ophub-debs.tar.gz" -C "$RUNNER_TEMP/ophub-debs"
+
+          HEADER_DEB="$(find "$RUNNER_TEMP/ophub-debs" -type f             \( -iname '*headers*.deb' -o -iname '*header*.deb' \) | head -n1)"
+          test -n "$HEADER_DEB"
+          echo "Using headers package: $HEADER_DEB"
+
+          dpkg-deb -x "$HEADER_DEB" "$RUNNER_TEMP/kernel-root"
+
+          KBUILD="$(find "$RUNNER_TEMP/kernel-root/usr/src" -maxdepth 1 -type d             -name "linux-headers-${KERNEL_VERSION}-ophub*" | head -n1)"
+          test -n "$KBUILD"
+          test -x "$KBUILD/scripts/mod/modpost"
+
+          echo "KBUILD=$KBUILD" >> "$GITHUB_ENV"
+
+      - name: Install matching Arm GNU 15.3 toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/toolchain"
+
+          curl -fL --retry 3 "$TOOLCHAIN_URL"             -o "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+
+          tar -xJf "$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"             -C "$RUNNER_TEMP/toolchain"
+
+          TOOLCHAIN_DIR="$(find "$RUNNER_TEMP/toolchain" -maxdepth 1 -type d             -name 'arm-gnu-toolchain-15.3.rel1-aarch64-aarch64-none-linux-gnu' | head -n1)"
+
+          test -x "$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-gcc"
+
+          echo "CC=$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "LD=$TOOLCHAIN_DIR/bin/aarch64-none-linux-gnu-ld.bfd" >> "$GITHUB_ENV"
+
+      - name: Clone TM16xx driver
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 "$DRIVER_REPO" "$RUNNER_TEMP/tm16xx"
+          test -f "$RUNNER_TEMP/tm16xx/drivers/auxdisplay/tm16xx_spi.c"
+          test -f "$RUNNER_TEMP/tm16xx/drivers/auxdisplay/tm16xx_core.c"
+          test -f "$RUNNER_TEMP/tm16xx/drivers/auxdisplay/line-display.c"
+
+          echo "DRIVER_DIR=$RUNNER_TEMP/tm16xx" >> "$GITHUB_ENV"
+
+      - name: Build SPI TM16xx modules
+        run: |
+          set -euxo pipefail
+
+          MDIR="$DRIVER_DIR/drivers/auxdisplay"
+
+          EXTRA_CFLAGS="-include $MDIR/tm16xx_compat.h -I$DRIVER_DIR/include -DCONFIG_TM16XX -DCONFIG_TM16XX_SPI -DCONFIG_TM16XX_KEYPAD"
+
+          make -j2             CC="$CC"             LD="$LD"             ARCH=arm64             KERNELRELEASE="${KERNEL_VERSION}-ophub"             EXTRA_CFLAGS="$EXTRA_CFLAGS"             -C "$KBUILD"             M="$MDIR"             CONFIG_LINEDISP=m             CONFIG_TM16XX=m             CONFIG_TM16XX_KEYPAD=y             CONFIG_TM16XX_I2C=n             CONFIG_TM16XX_SPI=m             modules
+
+          test -f "$MDIR/line-display.ko"
+          test -f "$MDIR/tm16xx.ko"
+          test -f "$MDIR/tm16xx_spi.ko"
+
+      - name: Package modules and test installer
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/pkg"
+
+          MDIR="$DRIVER_DIR/drivers/auxdisplay"
+
+          cp "$MDIR/line-display.ko" "$RUNNER_TEMP/pkg/"
+          cp "$MDIR/tm16xx.ko" "$RUNNER_TEMP/pkg/"
+          cp "$MDIR/tm16xx_spi.ko" "$RUNNER_TEMP/pkg/"
+          cp "$DRIVER_DIR/display-service" "$RUNNER_TEMP/pkg/"
+          cp "$DRIVER_DIR/display.service" "$RUNNER_TEMP/pkg/"
+
+          /sbin/modinfo "$RUNNER_TEMP/pkg/tm16xx.ko" || true
+          /sbin/modinfo "$RUNNER_TEMP/pkg/tm16xx_spi.ko" || true
+
+          cat > "$RUNNER_TEMP/pkg/install.sh" <<'INSTALL'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          EXPECTED_KERNEL="__EXPECTED_KERNEL__"
+          HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+          if [[ "$(uname -r)" != "$EXPECTED_KERNEL" ]]; then
+              echo "ERROR: built for $EXPECTED_KERNEL, running $(uname -r)" >&2
+              exit 1
+          fi
+
+          for f in line-display.ko tm16xx.ko tm16xx_spi.ko; do
+              [[ -f "$HERE/$f" ]] || { echo "ERROR: missing $f" >&2; exit 1; }
+          done
+
+          # OpenVFD was only used for the alternate driver path. It must not
+          # interfere with the native SPI/TM16xx driver.
+          sudo pkill -x vfdservice 2>/dev/null || true
+          sudo rmmod openvfd 2>/dev/null || true
+
+          DEST="/lib/modules/$EXPECTED_KERNEL/updates/tm16xx"
+          sudo mkdir -p "$DEST"
+          sudo install -m 0644 "$HERE/line-display.ko" "$DEST/"
+          sudo install -m 0644 "$HERE/tm16xx.ko" "$DEST/"
+          sudo install -m 0644 "$HERE/tm16xx_spi.ko" "$DEST/"
+
+          sudo depmod -a "$EXPECTED_KERNEL"
+
+          sudo modprobe line-display
+          sudo modprobe tm16xx
+          sudo modprobe tm16xx_spi
+
+          echo
+          echo "Loaded modules:"
+          lsmod | grep -E '^(tm16xx|tm16xx_spi|line_display)' || true
+
+          echo
+          echo "SPI device:"
+          for d in /sys/bus/spi/devices/*; do
+              [[ -e "$d" ]] || continue
+              echo "=== $d ==="
+              cat "$d/modalias" 2>/dev/null || true
+              readlink -f "$d/driver" 2>/dev/null || true
+          done
+
+          echo
+          echo "LED/display sysfs:"
+          find /sys/class/leds -maxdepth 2 -type f 2>/dev/null | sort || true
+
+          echo
+          echo "Recent TM16xx kernel messages:"
+          dmesg | grep -iE 'tm16|fd628|auxdisplay|linedisp' | tail -80 || true
+          INSTALL
+
+          sed -i "s/__EXPECTED_KERNEL__/${KERNEL_VERSION}-ophub/g"             "$RUNNER_TEMP/pkg/install.sh"
+          chmod +x "$RUNNER_TEMP/pkg/install.sh"
+
+          cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
+          TM16xx display modules for ${KERNEL_VERSION}-ophub
+          =================================================
+
+          Intended hardware path:
+            TX3 Mini front display
+            spi-gpio -> spi0.0 -> fdhisi,fd628 / titanmec,tm1628
+
+          The running kernel has CONFIG_AUXDISPLAY=y but TM16XX SPI disabled,
+          so these modules provide the missing driver without replacing the DTB.
+
+          Install:
+            chmod +x install.sh
+            ./install.sh
+
+          After successful binding, /sys/class/leds/display and related
+          display LED entries should appear.
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tm16xx-${{ inputs.kernel_version }}-ophub-aarch64
+          path: ${{ runner.temp }}/pkg/
+          if-no-files-found: error
+          retention-days: 30
