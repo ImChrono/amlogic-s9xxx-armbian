@@ -87,13 +87,37 @@ jobs:
 
           MDIR="$DRIVER_DIR/drivers/auxdisplay"
 
+          # The upstream repository carries a full in-tree auxdisplay Makefile.
+          # When used as an external module that Makefile also references kernel
+          # sources (charlcd.o, hd44780.o, etc.) that are not part of this repo.
+          # Replace it in the temporary clone with a minimal external-module Kbuild.
+          cp "$MDIR/Makefile" "$MDIR/Makefile.upstream"
+
+          cat > "$MDIR/Makefile" <<'KBUILD'
+          obj-m += line-display.o
+          obj-m += tm16xx.o
+          tm16xx-y := tm16xx_core.o tm16xx_keypad.o
+          obj-m += tm16xx_spi.o
+          KBUILD
+
           EXTRA_CFLAGS="-include $MDIR/tm16xx_compat.h -I$DRIVER_DIR/include -DCONFIG_TM16XX -DCONFIG_TM16XX_SPI -DCONFIG_TM16XX_KEYPAD"
 
-          make -j2             CC="$CC"             LD="$LD"             ARCH=arm64             KERNELRELEASE="${KERNEL_VERSION}-ophub"             EXTRA_CFLAGS="$EXTRA_CFLAGS"             -C "$KBUILD"             M="$MDIR"             CONFIG_LINEDISP=m             CONFIG_TM16XX=m             CONFIG_TM16XX_KEYPAD=y             CONFIG_TM16XX_I2C=n             CONFIG_TM16XX_SPI=m             modules
+          make -j2 \
+            CC="$CC" \
+            LD="$LD" \
+            ARCH=arm64 \
+            KERNELRELEASE="${KERNEL_VERSION}-ophub" \
+            EXTRA_CFLAGS="$EXTRA_CFLAGS" \
+            -C "$KBUILD" \
+            M="$MDIR" \
+            modules
 
           test -f "$MDIR/line-display.ko"
           test -f "$MDIR/tm16xx.ko"
           test -f "$MDIR/tm16xx_spi.ko"
+
+          echo "Built modules:"
+          ls -lh "$MDIR/"*.ko
 
       - name: Package modules and test installer
         run: |
