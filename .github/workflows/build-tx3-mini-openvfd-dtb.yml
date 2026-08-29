@@ -28,80 +28,77 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install device-tree compiler
+      - name: Install device-tree tools
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y device-tree-compiler
+          command -v dtc
+          command -v fdtoverlay
 
-      - name: Use TX3 Mini DTB from this repository
+      - name: Verify base DTB from repository
         run: |
           set -euxo pipefail
           test -f "$REPO_DTB"
-
-          echo "Using repository DTB:"
+          echo "Base DTB:"
           ls -l "$REPO_DTB"
           sha256sum "$REPO_DTB"
 
-          # This is the same platform DTB shipped by the amlogic-s9xxx-armbian tree.
-          echo "SOURCE_DTB=$GITHUB_WORKSPACE/$REPO_DTB" >> "$GITHUB_ENV"
+          # Ensure the repository DTB is valid before touching it.
+          dtc -I dtb -O dts "$REPO_DTB" -o /tmp/base.dts
+          grep -F 'model = "Oranth Tanix TX3 Mini";' /tmp/base.dts || true
 
-      - name: Decompile DTB
+      - name: Build OpenVFD overlay
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/work"
-          dtc -I dtb -O dts \
-            -o "$RUNNER_TEMP/work/tx3-mini.dts" \
-            "$SOURCE_DTB"
+          mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/pkg"
 
-      - name: Inject OpenVFD node
-        shell: python
-        run: |
-          from pathlib import Path
-          import re
+          cat > "$RUNNER_TEMP/work/openvfd-overlay.dts" <<'DTS'
+          /dts-v1/;
+          /plugin/;
 
-          p = Path("${{ runner.temp }}/work/tx3-mini.dts")
-          lines = p.read_text().splitlines(keepends=True)
+          / {
+              compatible = "amlogic,meson-gxl";
 
-          if any('compatible = "open,vfd";' in line for line in lines):
-              print("OpenVFD node already present; leaving DTS unchanged.")
-          else:
-              root_start = None
-              depth = 0
-              first_root_subnode = None
+              fragment@0 {
+                  target-path = "/";
 
-              for i, line in enumerate(lines):
-                  stripped = line.strip()
+                  __overlay__ {
+                      openvfd {
+                          compatible = "open,vfd";
+                          dev_name = "openvfd";
+                          status = "okay";
+                      };
+                  };
+              };
+          };
+          DTS
 
-                  if root_start is None:
-                      if stripped == "/ {":
-                          root_start = i
-                          depth = 1
-                      continue
+          dtc -@ -I dts -O dtb             -o "$RUNNER_TEMP/work/openvfd-overlay.dtbo"             "$RUNNER_TEMP/work/openvfd-overlay.dts"
 
-                  # At depth 1 we are directly inside the root node.
-                  # Device-tree syntax requires all root properties to come
-                  # before child nodes, so insert immediately before the
-                  # first root-level child node (usually aliases/chosen/etc).
-                  if depth == 1 and re.match(r'^[A-Za-z0-9_#,+.@\\-]+(?:@[A-Fa-f0-9]+)?\\s*\\{\\s*
-      - name: Compile and verify patched DTB
+      - name: Apply overlay to TX3 Mini DTB
         run: |
           set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/pkg"
 
-          dtc -I dts -O dtb \
-            -o "$RUNNER_TEMP/pkg/$DTB_NAME" \
-            "$RUNNER_TEMP/work/tx3-mini.dts"
+          fdtoverlay             -i "$REPO_DTB"             -o "$RUNNER_TEMP/pkg/$DTB_NAME"             "$RUNNER_TEMP/work/openvfd-overlay.dtbo"
 
           echo "Patched DTB:"
           ls -l "$RUNNER_TEMP/pkg/$DTB_NAME"
           sha256sum "$RUNNER_TEMP/pkg/$DTB_NAME"
 
-          echo "Verifying OpenVFD node:"
-          dtc -I dtb -O dts "$RUNNER_TEMP/pkg/$DTB_NAME" \
-            | grep -A6 -B2 -F 'compatible = "open,vfd";'
+      - name: Verify patched DTB
+        run: |
+          set -euxo pipefail
 
-          cp "$RUNNER_TEMP/work/tx3-mini.dts" "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
+          dtc -I dtb -O dts             "$RUNNER_TEMP/pkg/$DTB_NAME"             -o "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
+
+          grep -A6 -B2 -F 'compatible = "open,vfd";'             "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
+
+          # Verify that the important base identity is still present too.
+          grep -F 'model = "Oranth Tanix TX3 Mini";'             "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts" || true
+
+          cp "$RUNNER_TEMP/work/openvfd-overlay.dts"             "$RUNNER_TEMP/pkg/openvfd-overlay.dts"
+          cp "$RUNNER_TEMP/work/openvfd-overlay.dtbo"             "$RUNNER_TEMP/pkg/openvfd-overlay.dtbo"
 
           if [ -f "$OPENVFD_CONF" ]; then
             cp "$OPENVFD_CONF" "$RUNNER_TEMP/pkg/tx3-mini.conf"
@@ -162,154 +159,21 @@ jobs:
           echo "Original DTB restored. Reboot with: sudo reboot"
           RESTORE
 
-          chmod +x "$RUNNER_TEMP/pkg/install-dtb.sh" "$RUNNER_TEMP/pkg/restore-dtb.sh"
+          chmod +x "$RUNNER_TEMP/pkg/install-dtb.sh"                    "$RUNNER_TEMP/pkg/restore-dtb.sh"
 
           cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
           TX3 Mini OpenVFD DTB
           ====================
+
           Base DTB:
             $REPO_DTB
 
           Artifact label:
             ${KERNEL_VERSION}
 
-          The base DTB is taken directly from this amlogic-s9xxx-armbian repository.
-          The workflow adds only the minimal OpenVFD node.
-
-          Install:
-            chmod +x install-dtb.sh restore-dtb.sh
-            sudo ./install-dtb.sh
-            sudo reboot
-
-          Rollback:
-            sudo ./restore-dtb.sh
-            sudo reboot
-          EOF
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tx3-mini-openvfd-dtb-${{ inputs.kernel_version }}
-          path: ${{ runner.temp }}/pkg/
-          if-no-files-found: error
-          retention-days: 30
-, stripped):
-                      first_root_subnode = i
-                      break
-
-                  depth += line.count("{")
-                  depth -= line.count("}")
-
-              if root_start is None:
-                  raise SystemExit("Root node '/ {' not found in decompiled DTS")
-              if first_root_subnode is None:
-                  raise SystemExit("Could not locate first root-level subnode")
-
-              node = """\
-\topenvfd {
-\t\tcompatible = "open,vfd";
-\t\tdev_name = "openvfd";
-\t\tstatus = "okay";
-\t};
-
-"""
-              lines[first_root_subnode:first_root_subnode] = [node]
-              p.write_text("".join(lines))
-
-          assert 'compatible = "open,vfd";' in p.read_text()
-          print("OpenVFD node inserted before first root-level subnode.")
-
-      - name: Compile and verify patched DTB
-        run: |
-          set -euxo pipefail
-          mkdir -p "$RUNNER_TEMP/pkg"
-
-          dtc -I dts -O dtb \
-            -o "$RUNNER_TEMP/pkg/$DTB_NAME" \
-            "$RUNNER_TEMP/work/tx3-mini.dts"
-
-          echo "Patched DTB:"
-          ls -l "$RUNNER_TEMP/pkg/$DTB_NAME"
-          sha256sum "$RUNNER_TEMP/pkg/$DTB_NAME"
-
-          echo "Verifying OpenVFD node:"
-          dtc -I dtb -O dts "$RUNNER_TEMP/pkg/$DTB_NAME" \
-            | grep -A6 -B2 -F 'compatible = "open,vfd";'
-
-          cp "$RUNNER_TEMP/work/tx3-mini.dts" "$RUNNER_TEMP/pkg/tx3-mini-openvfd.dts"
-
-          if [ -f "$OPENVFD_CONF" ]; then
-            cp "$OPENVFD_CONF" "$RUNNER_TEMP/pkg/tx3-mini.conf"
-          fi
-
-      - name: Create safe installer and rollback
-        run: |
-          set -euxo pipefail
-
-          cat > "$RUNNER_TEMP/pkg/install-dtb.sh" <<'INSTALL'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          TARGET="/boot/dtb/amlogic/meson-gxl-s905w-tx3-mini.dtb"
-          SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/meson-gxl-s905w-tx3-mini.dtb"
-          BACKUP="${TARGET}.pre-openvfd"
-
-          [[ $EUID -eq 0 ]] || { echo "Run as root: sudo ./install-dtb.sh"; exit 1; }
-          [[ -f "$SRC" ]] || { echo "Missing patched DTB: $SRC"; exit 1; }
-          [[ -f "$TARGET" ]] || { echo "Current DTB not found: $TARGET"; exit 1; }
-
-          echo "Current DTB:"
-          ls -l "$TARGET"
-          sha256sum "$TARGET"
-
-          echo "New DTB:"
-          ls -l "$SRC"
-          sha256sum "$SRC"
-
-          if [[ ! -f "$BACKUP" ]]; then
-              cp -a "$TARGET" "$BACKUP"
-              echo "Backup created: $BACKUP"
-          else
-              echo "Backup already exists: $BACKUP"
-          fi
-
-          install -m 0644 "$SRC" "$TARGET"
-          sync
-
-          echo
-          echo "Patched DTB installed."
-          echo "Reboot with: sudo reboot"
-          echo "Rollback with: sudo ./restore-dtb.sh"
-          INSTALL
-
-          cat > "$RUNNER_TEMP/pkg/restore-dtb.sh" <<'RESTORE'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-
-          TARGET="/boot/dtb/amlogic/meson-gxl-s905w-tx3-mini.dtb"
-          BACKUP="${TARGET}.pre-openvfd"
-
-          [[ $EUID -eq 0 ]] || { echo "Run as root: sudo ./restore-dtb.sh"; exit 1; }
-          [[ -f "$BACKUP" ]] || { echo "Backup not found: $BACKUP"; exit 1; }
-
-          cp -a "$BACKUP" "$TARGET"
-          sync
-          echo "Original DTB restored. Reboot with: sudo reboot"
-          RESTORE
-
-          chmod +x "$RUNNER_TEMP/pkg/install-dtb.sh" "$RUNNER_TEMP/pkg/restore-dtb.sh"
-
-          cat > "$RUNNER_TEMP/pkg/README.txt" <<EOF
-          TX3 Mini OpenVFD DTB
-          ====================
-          Base DTB:
-            $REPO_DTB
-
-          Artifact label:
-            ${KERNEL_VERSION}
-
-          The base DTB is taken directly from this amlogic-s9xxx-armbian repository.
-          The workflow adds only the minimal OpenVFD node.
+          This workflow does not edit the decompiled DTS by string manipulation.
+          It builds a small Device Tree overlay and applies it to the repository
+          DTB with fdtoverlay.
 
           Install:
             chmod +x install-dtb.sh restore-dtb.sh
